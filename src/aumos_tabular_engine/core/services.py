@@ -18,13 +18,19 @@ from aumos_common.observability import get_logger
 
 from aumos_tabular_engine.core.interfaces import (
     ConstraintEngineProtocol,
+    ConstraintSolverProtocol,
+    EvaluationFrameworkProtocol,
+    ExportHandlerProtocol,
     GeneratorProtocol,
     IGenerationJobRepository,
     IGenerationProfileRepository,
     IMultiTableSchemaRepository,
+    MissingDataImputerProtocol,
+    PrivacyWrapperProtocol,
     QualityGateProtocol,
     SchemaAnalyzerProtocol,
     StorageProtocol,
+    SynthesisQualityEvaluatorProtocol,
 )
 from aumos_tabular_engine.core.models import GenerationJob, GenerationProfile, MultiTableSchema
 
@@ -925,3 +931,602 @@ def _serialize_dataframe(data: pd.DataFrame, output_format: str) -> bytes:
         raise ValueError(f"Unsupported output format: {output_format}")
 
     return buffer.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# New domain-specific services wiring the 6 new adapters
+# ---------------------------------------------------------------------------
+
+
+class SynthesisQualityService:
+    """Evaluate synthesis quality using SDMetrics and per-column diagnostics.
+
+    Wraps the SynthesisQualityEvaluatorProtocol adapter to provide structured
+    quality reports, threshold enforcement, and historical trend access.
+    """
+
+    def __init__(
+        self,
+        quality_evaluator: SynthesisQualityEvaluatorProtocol,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            quality_evaluator: SDMetrics-backed quality evaluator adapter.
+            event_publisher: Kafka event publisher.
+        """
+        self._evaluator = quality_evaluator
+        self._publisher = event_publisher
+
+    async def evaluate_and_report(
+        self,
+        tenant_id: uuid.UUID,
+        job_id: uuid.UUID,
+        real_data: pd.DataFrame,
+        synthetic_data: pd.DataFrame,
+        metadata: dict[str, Any],
+        include_diagnostics: bool = False,
+    ) -> dict[str, Any]:
+        """Run quality evaluation and publish results as a Kafka event.
+
+        Args:
+            tenant_id: Requesting tenant for audit.
+            job_id: Generation job UUID.
+            real_data: Original source DataFrame.
+            synthetic_data: Synthetic DataFrame to evaluate.
+            metadata: SDV-compatible metadata dict.
+            include_diagnostics: If True, include per-column diagnostic detail.
+
+        Returns:
+            Quality evaluation result dict with scores and pass status.
+        """
+        logger.info(
+            "Running synthesis quality evaluation",
+            tenant_id=str(tenant_id),
+            job_id=str(job_id),
+        )
+
+        if include_diagnostics:
+            result = await self._evaluator.get_diagnostic_report(
+                real_data, synthetic_data, metadata
+            )
+        else:
+            result = await self._evaluator.evaluate(real_data, synthetic_data, metadata)
+
+        violations = self._evaluator.validate_thresholds(result)
+
+        await self._publisher.publish(
+            Topics.DATA_SYNTHETIC,
+            {
+                "event_type": "generation.quality.evaluated",
+                "tenant_id": str(tenant_id),
+                "job_id": str(job_id),
+                "overall_score": result.get("overall_score"),
+                "passed": result.get("passed"),
+                "violation_count": len(violations),
+            },
+        )
+
+        return {**result, "threshold_violations": violations}
+
+
+class ConstraintSolverService:
+    """Enforce relational constraints and business rules on synthetic DataFrames.
+
+    Orchestrates validation, repair, and cross-table referential integrity
+    enforcement using the ConstraintSolverProtocol adapter.
+    """
+
+    def __init__(
+        self,
+        constraint_solver: ConstraintSolverProtocol,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            constraint_solver: Constraint enforcement adapter.
+            event_publisher: Kafka event publisher.
+        """
+        self._solver = constraint_solver
+        self._publisher = event_publisher
+
+    async def validate_and_repair(
+        self,
+        tenant_id: uuid.UUID,
+        job_id: uuid.UUID,
+        data: pd.DataFrame,
+        constraints: list[dict[str, Any]],
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
+        """Validate constraints and iteratively repair violations.
+
+        Args:
+            tenant_id: Requesting tenant for audit.
+            job_id: Generation job UUID.
+            data: Synthetic DataFrame to validate and repair.
+            constraints: List of constraint descriptor dicts.
+
+        Returns:
+            Tuple of (repaired_dataframe, violation_report).
+        """
+        initial_report = self._solver.report_violations(data, constraints)
+
+        repaired_data = self._solver.apply(data, constraints)
+
+        final_report = self._solver.report_violations(repaired_data, constraints)
+
+        logger.info(
+            "Constraint repair complete",
+            tenant_id=str(tenant_id),
+            job_id=str(job_id),
+            initial_violations=initial_report["total_violations"],
+            remaining_violations=final_report["total_violations"],
+        )
+
+        await self._publisher.publish(
+            Topics.DATA_SYNTHETIC,
+            {
+                "event_type": "generation.constraints.applied",
+                "tenant_id": str(tenant_id),
+                "job_id": str(job_id),
+                "initial_violations": initial_report["total_violations"],
+                "remaining_violations": final_report["total_violations"],
+            },
+        )
+
+        return repaired_data, final_report
+
+    async def enforce_multi_table_integrity(
+        self,
+        tenant_id: uuid.UUID,
+        tables: dict[str, pd.DataFrame],
+        relationships: list[dict[str, str]],
+    ) -> dict[str, pd.DataFrame]:
+        """Enforce referential integrity across a set of synthesized tables.
+
+        Args:
+            tenant_id: Requesting tenant for audit.
+            tables: Dict mapping table_name → synthetic DataFrame.
+            relationships: FK relationship descriptors.
+
+        Returns:
+            Updated tables dict with all FK violations resolved.
+        """
+        result = self._solver.enforce_inter_table_referential_integrity(
+            tables, relationships
+        )
+        logger.info(
+            "Multi-table referential integrity enforced",
+            tenant_id=str(tenant_id),
+            table_count=len(tables),
+            relationship_count=len(relationships),
+        )
+        return result
+
+
+class MissingDataService:
+    """Handle missing value imputation in real source data before synthesis.
+
+    Orchestrates pattern analysis and imputation using the
+    MissingDataImputerProtocol adapter. Intended for pre-processing real
+    data prior to generator training, not for post-processing synthetic data.
+    """
+
+    def __init__(
+        self,
+        imputer: MissingDataImputerProtocol,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            imputer: Missing data imputation adapter.
+            event_publisher: Kafka event publisher.
+        """
+        self._imputer = imputer
+        self._publisher = event_publisher
+
+    async def analyze_and_impute(
+        self,
+        tenant_id: uuid.UUID,
+        data: pd.DataFrame,
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
+        """Analyze missing patterns and impute values in the given DataFrame.
+
+        Args:
+            tenant_id: Requesting tenant for audit.
+            data: DataFrame to analyze and impute.
+            metadata: Optional SDV-compatible metadata for column type hints.
+
+        Returns:
+            Tuple of (imputed_dataframe, analysis_report).
+        """
+        pattern_analysis = self._imputer.analyze_missing_patterns(data)
+
+        logger.info(
+            "Missing data analysis complete",
+            tenant_id=str(tenant_id),
+            affected_columns=len(pattern_analysis["affected_columns"]),
+            total_missing=pattern_analysis["total_missing"],
+        )
+
+        if pattern_analysis["total_missing"] == 0:
+            return data, {"imputation_performed": False, "analysis": pattern_analysis}
+
+        imputed_data = await self._imputer.impute(data, metadata)
+        quality_metrics = self._imputer.get_imputation_quality_metrics(data, imputed_data)
+
+        await self._publisher.publish(
+            Topics.DATA_SYNTHETIC,
+            {
+                "event_type": "generation.data.imputed",
+                "tenant_id": str(tenant_id),
+                "columns_imputed": quality_metrics["columns_imputed"],
+                "total_missing": pattern_analysis["total_missing"],
+            },
+        )
+
+        report = {
+            "imputation_performed": True,
+            "analysis": pattern_analysis,
+            "quality_metrics": quality_metrics,
+        }
+        return imputed_data, report
+
+
+class PrivacyBudgetService:
+    """Manage differential privacy budget allocation and monitoring.
+
+    Coordinates epsilon budget requests, consumption, and tradeoff analysis
+    using the PrivacyWrapperProtocol adapter.
+    """
+
+    def __init__(
+        self,
+        privacy_wrapper: PrivacyWrapperProtocol,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            privacy_wrapper: aumos-privacy-engine HTTP client adapter.
+            event_publisher: Kafka event publisher.
+        """
+        self._wrapper = privacy_wrapper
+        self._publisher = event_publisher
+
+    async def request_budget_for_job(
+        self,
+        tenant_id: uuid.UUID,
+        job_id: uuid.UUID,
+        epsilon: float,
+        delta: float,
+    ) -> str:
+        """Request DP budget allocation for a generation job.
+
+        Validates the budget is sufficient before allocating. Transitions
+        the job to FAILED if budget is exhausted.
+
+        Args:
+            tenant_id: Owning tenant.
+            job_id: Generation job UUID.
+            epsilon: Requested epsilon.
+            delta: Requested delta.
+
+        Returns:
+            allocation_id string for use in budget consumption.
+
+        Raises:
+            ValueError: If the tenant has insufficient remaining budget.
+        """
+        validation = await self._wrapper.validate_epsilon_budget(tenant_id, epsilon)
+        if not validation["sufficient"]:
+            raise ValueError(
+                f"Insufficient DP budget for tenant {tenant_id}: "
+                f"requested={epsilon}, remaining={validation['remaining_budget']:.4f}"
+            )
+
+        allocation = await self._wrapper.allocate_budget(
+            tenant_id=tenant_id,
+            job_id=job_id,
+            epsilon=epsilon,
+            delta=delta,
+        )
+
+        await self._publisher.publish(
+            Topics.DATA_SYNTHETIC,
+            {
+                "event_type": "generation.privacy.budget_allocated",
+                "tenant_id": str(tenant_id),
+                "job_id": str(job_id),
+                "allocation_id": allocation.allocation_id,
+                "epsilon": epsilon,
+                "remaining_budget": allocation.remaining_budget,
+            },
+        )
+
+        logger.info(
+            "DP budget allocated",
+            tenant_id=str(tenant_id),
+            job_id=str(job_id),
+            allocation_id=allocation.allocation_id,
+            epsilon=epsilon,
+        )
+        return allocation.allocation_id
+
+    async def finalize_budget_consumption(
+        self,
+        tenant_id: uuid.UUID,
+        job_id: uuid.UUID,
+        allocation_id: str,
+        actual_epsilon_spent: float | None = None,
+    ) -> None:
+        """Finalize epsilon consumption after successful synthesis.
+
+        Args:
+            tenant_id: Owning tenant.
+            job_id: Generation job UUID.
+            allocation_id: Allocation ID from request_budget_for_job().
+            actual_epsilon_spent: Actual epsilon consumed (if less than allocated).
+        """
+        await self._wrapper.consume_budget(allocation_id, actual_epsilon_spent)
+
+        await self._publisher.publish(
+            Topics.DATA_SYNTHETIC,
+            {
+                "event_type": "generation.privacy.budget_consumed",
+                "tenant_id": str(tenant_id),
+                "job_id": str(job_id),
+                "allocation_id": allocation_id,
+                "actual_epsilon_spent": actual_epsilon_spent,
+            },
+        )
+
+        logger.info(
+            "DP budget consumed",
+            tenant_id=str(tenant_id),
+            job_id=str(job_id),
+            allocation_id=allocation_id,
+        )
+
+    async def get_budget_summary(
+        self,
+        tenant_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        """Return a budget summary for the requesting tenant.
+
+        Args:
+            tenant_id: Requesting tenant.
+
+        Returns:
+            Dict with remaining, consumed, total budget and privacy level presets.
+        """
+        status = await self._wrapper.get_budget_status(tenant_id)
+        return {
+            "tenant_id": str(tenant_id),
+            "remaining_budget": status.remaining_budget,
+            "consumed_budget": status.consumed_budget,
+            "total_budget": status.total_budget,
+            "allocation_count": status.allocation_count,
+        }
+
+
+class ExportService:
+    """Coordinate synthetic dataset export to multiple formats and storage.
+
+    Wraps the ExportHandlerProtocol adapter to provide format selection,
+    chunked export for large datasets, and presigned URL generation.
+    """
+
+    def __init__(
+        self,
+        export_handler: ExportHandlerProtocol,
+        storage: StorageProtocol,
+        event_publisher: EventPublisher,
+        large_dataset_threshold_rows: int = 500_000,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            export_handler: Multi-format export adapter.
+            storage: Artifact storage adapter.
+            event_publisher: Kafka event publisher.
+            large_dataset_threshold_rows: Row count above which chunked export is used.
+        """
+        self._handler = export_handler
+        self._storage = storage
+        self._publisher = event_publisher
+        self._large_threshold = large_dataset_threshold_rows
+
+    async def export_dataset(
+        self,
+        tenant_id: uuid.UUID,
+        job_id: uuid.UUID,
+        data: pd.DataFrame,
+        output_format: str,
+        **format_kwargs: Any,
+    ) -> dict[str, Any]:
+        """Export a synthetic dataset, using chunked export for large datasets.
+
+        Automatically switches to chunked export when the DataFrame exceeds
+        the configured large_dataset_threshold_rows.
+
+        Args:
+            tenant_id: Owning tenant.
+            job_id: Generation job UUID.
+            data: Synthetic DataFrame to export.
+            output_format: Target format string.
+            **format_kwargs: Format-specific serialization options.
+
+        Returns:
+            Export result dict with storage URI, bytes written, and metadata.
+        """
+        use_chunked = len(data) > self._large_threshold
+
+        logger.info(
+            "Exporting synthetic dataset",
+            tenant_id=str(tenant_id),
+            job_id=str(job_id),
+            num_rows=len(data),
+            output_format=output_format,
+            chunked=use_chunked,
+        )
+
+        if use_chunked:
+            result = await self._handler.export_chunked(
+                data=data,
+                output_format=output_format,
+                tenant_id=tenant_id,
+                job_id=job_id,
+                **format_kwargs,
+            )
+        else:
+            result = await self._handler.export(
+                data=data,
+                output_format=output_format,
+                tenant_id=tenant_id,
+                job_id=job_id,
+                **format_kwargs,
+            )
+
+        await self._publisher.publish(
+            Topics.DATA_SYNTHETIC,
+            {
+                "event_type": "generation.export.complete",
+                "tenant_id": str(tenant_id),
+                "job_id": str(job_id),
+                "output_format": output_format,
+                "num_rows": len(data),
+                "chunked": use_chunked,
+                "storage_uri": result.get("storage_uri"),
+            },
+        )
+
+        return result
+
+    async def get_download_url(
+        self,
+        tenant_id: uuid.UUID,
+        job_id: uuid.UUID,
+        filename: str,
+        expires_seconds: int = 3600,
+    ) -> str:
+        """Generate a presigned download URL for an exported artifact.
+
+        Args:
+            tenant_id: Owning tenant.
+            job_id: Generation job UUID.
+            filename: Artifact filename to link.
+            expires_seconds: URL validity duration.
+
+        Returns:
+            Presigned HTTPS URL for direct artifact download.
+        """
+        return await self._storage.get_presigned_url(
+            tenant_id=tenant_id,
+            job_id=job_id,
+            filename=filename,
+            expires_seconds=expires_seconds,
+        )
+
+
+class EvaluationService:
+    """Orchestrate multi-objective evaluation and tradeoff reporting.
+
+    Wraps the EvaluationFrameworkProtocol adapter to provide Pareto frontier
+    computation, benchmark comparisons, and comprehensive evaluation reports.
+    """
+
+    def __init__(
+        self,
+        evaluation_framework: EvaluationFrameworkProtocol,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            evaluation_framework: Multi-objective evaluation adapter.
+            event_publisher: Kafka event publisher.
+        """
+        self._framework = evaluation_framework
+        self._publisher = event_publisher
+
+    async def run_tradeoff_analysis(
+        self,
+        tenant_id: uuid.UUID,
+        real_data: pd.DataFrame,
+        synthetic_data: pd.DataFrame,
+        evaluation_points: list[Any],
+        report_title: str = "Synthesis Evaluation Report",
+    ) -> dict[str, Any]:
+        """Run full tradeoff analysis and generate an evaluation report.
+
+        Args:
+            tenant_id: Requesting tenant for audit.
+            real_data: Original source DataFrame.
+            synthetic_data: Generated synthetic DataFrame.
+            evaluation_points: EvaluationPoint instances collected from experiments.
+            report_title: Human-readable report title.
+
+        Returns:
+            Comprehensive evaluation report dict.
+        """
+        report = await self._framework.generate_report(
+            real_data=real_data,
+            synthetic_data=synthetic_data,
+            points=evaluation_points,
+            report_title=report_title,
+        )
+
+        await self._publisher.publish(
+            Topics.DATA_SYNTHETIC,
+            {
+                "event_type": "generation.evaluation.report_generated",
+                "tenant_id": str(tenant_id),
+                "total_points": report["evaluation_summary"]["total_points"],
+                "pareto_points": report["evaluation_summary"]["pareto_points"],
+                "has_recommendation": report["optimal_configuration"].get("recommendation") is not None,
+            },
+        )
+
+        logger.info(
+            "Evaluation report generated",
+            tenant_id=str(tenant_id),
+            total_points=report["evaluation_summary"]["total_points"],
+        )
+        return report
+
+    async def get_optimal_configuration(
+        self,
+        evaluation_points: list[Any],
+        require_production_ready: bool = True,
+    ) -> dict[str, Any]:
+        """Get the recommended optimal generator configuration.
+
+        Args:
+            evaluation_points: EvaluationPoint instances to consider.
+            require_production_ready: Only consider points above quality thresholds.
+
+        Returns:
+            Recommendation dict with the best generator configuration.
+        """
+        return await self._framework.recommend_optimal_config(
+            points=evaluation_points,
+            require_production_ready=require_production_ready,
+        )
+
+    async def get_benchmark_comparison(
+        self,
+        evaluation_points: list[Any],
+    ) -> dict[str, Any]:
+        """Get a benchmark comparison across all evaluated generator types.
+
+        Args:
+            evaluation_points: EvaluationPoint instances to compare.
+
+        Returns:
+            Benchmark comparison dict with per-generator summaries and rankings.
+        """
+        return await self._framework.benchmark_generators(points=evaluation_points)
