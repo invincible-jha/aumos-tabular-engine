@@ -1,0 +1,51 @@
+site_name: AumOS Tabular Engine
+site_url: https://docs.aumos.ai/tabular-engine
+site_description: Enterprise synthetic tabular data generation with differential privacy
+
+theme:
+  name: material
+  palette:
+    primary: indigo
+    accent: indigo
+  features:
+    - navigation.tabs
+    - navigation.top
+    - search.suggest
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: google
+            show_source: true
+  - autorefs
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Concepts:
+      - Generators: concepts/generators.md
+      - Privacy Budget: concepts/privacy-budget.md
+      - Quality Gates: concepts/quality-gates.md
+      - Multi-Table: concepts/multi-table.md
+  - API Reference:
+      - Jobs: api-reference/jobs.md
+      - Profiles: api-reference/profiles.md
+      - Schemas: api-reference/schemas.md
+  - Tutorials:
+      - First Dataset: tutorials/first-dataset.md
+      - DP Generation: tutorials/dp-generation.md
+      - Multi-Table: tutorials/multi-table.md
+  - Troubleshooting: troubleshooting.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.tabbed
+
+extra:
+  version:
+    provider: mike

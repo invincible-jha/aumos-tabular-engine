@@ -39,9 +39,31 @@ dependencies = [
     "asyncpg>=0.29.0",
     "aiokafka>=0.10.0",
     "minio>=7.2.0",
+    # Time-series generators (GAP-64)
+    "deepecho>=0.4",
+    # Demo mode SQLite driver (GAP-65)
+    "aiosqlite>=0.20",
 ]
 
 [project.optional-dependencies]
+docs = [
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.24",
+    "mkdocs-autorefs>=1.0",
+]
+benchmarks = [
+    "sdgym>=0.6",
+    "matplotlib>=3.8",
+    "tabulate>=0.9",
+]
+connectors = [
+    "snowflake-connector-python[pandas,arrow]>=3.7",
+    "google-cloud-bigquery[pandas]>=3.19",
+    "databricks-sql-connector>=3.3",
+]
+sdk = [
+    "ipywidgets>=8.1",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",

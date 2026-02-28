@@ -122,6 +122,37 @@ class GenerationJob(AumOSModel):
         nullable=True,
         comment="Privacy engine allocation ID for DP budget tracking",
     )
+    sequence_config: Mapped[dict | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="Time-series sequence configuration (sequence_key, sequence_index, generator)",
+    )
+    sequence_key: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="Column identifying each sequence for time-series generation",
+    )
+    sequence_index: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="Column defining temporal order for time-series generation",
+    )
+    output_parts: Mapped[list | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="List of part URIs for multi-part streaming output",
+    )
+    streaming_mode: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        comment="Whether this job uses chunked streaming generation",
+    )
+    chunk_size: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        comment="Chunk size in rows for streaming generation",
+    )
 
     profile: Mapped["GenerationProfile | None"] = relationship(
         "GenerationProfile",

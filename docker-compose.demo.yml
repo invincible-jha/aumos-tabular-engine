@@ -1,0 +1,38 @@
+version: "3.9"
+
+# Demo mode — no external dependencies required.
+# Starts with SQLite, local filesystem storage, and no Kafka/MinIO/privacy engine.
+#
+# Usage:
+#   docker compose -f docker-compose.demo.yml up
+#
+# Then visit http://localhost:8006/docs to explore the API.
+
+services:
+  tabular-engine:
+    build:
+      context: .
+      target: production
+    environment:
+      AUMOS_ENV: demo
+      AUMOS_TAB_DEMO_MODE: "true"
+      AUMOS_DATABASE_URL: "sqlite+aiosqlite:///./demo.db"
+      AUMOS_TAB_STORAGE_BACKEND: local
+      AUMOS_TAB_LOCAL_STORAGE_PATH: /app/demo-output
+      AUMOS_TAB_KAFKA_ENABLED: "false"
+      AUMOS_TAB_PRIVACY_ENGINE_URL: ""
+      AUMOS_TAB_STREAMING_ENABLED: "true"
+      AUMOS_LOG_LEVEL: INFO
+    ports:
+      - "8006:8006"
+    volumes:
+      - ./demo-data:/app/demo-data:ro
+      - demo-output:/app/demo-output
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  demo-output:

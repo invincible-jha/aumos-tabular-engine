@@ -93,4 +93,50 @@ class Settings(AumOSSettings):
         description="Timeout for HTTP calls to downstream services",
     )
 
+    # Demo mode
+    demo_mode: bool = Field(
+        default=False,
+        description="Enable demo mode: SQLite, local storage, stub privacy client",
+    )
+    storage_backend: str = Field(
+        default="minio",
+        description="Storage backend: 'minio' or 'local'",
+    )
+    kafka_enabled: bool = Field(
+        default=True,
+        description="Whether Kafka event publishing is enabled",
+    )
+    local_storage_path: str = Field(
+        default="./demo-output",
+        description="Local filesystem path for demo mode storage",
+    )
+
+    # Time-series defaults
+    default_par_epochs: int = Field(
+        default=128,
+        description="Default training epochs for PAR time-series generator",
+    )
+    max_sequence_len: int = Field(
+        default=500,
+        description="Maximum sequence length for DeepEcho generator",
+    )
+    deepecho_segment_size: int = Field(
+        default=50,
+        description="Segment size for DeepEcho LSTM state management",
+    )
+
+    # Streaming defaults
+    streaming_chunk_size: int = Field(
+        default=100_000,
+        description="Rows per training chunk for streaming generation",
+    )
+    streaming_output_chunk_size: int = Field(
+        default=500_000,
+        description="Rows per output Parquet part for streaming generation",
+    )
+    streaming_enabled: bool = Field(
+        default=True,
+        description="Whether streaming generation is enabled",
+    )
+
     model_config = SettingsConfigDict(env_prefix="AUMOS_")

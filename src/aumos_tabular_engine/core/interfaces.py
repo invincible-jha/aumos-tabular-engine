@@ -747,6 +747,66 @@ class IGenerationProfileRepository(Protocol):
         ...
 
 
+@runtime_checkable
+class TemporalGeneratorProtocol(Protocol):
+    """Protocol for time-series/sequential data generator adapters.
+
+    Implementations (PARGenerator, DeepEchoGenerator) must implement train() and generate().
+    """
+
+    async def train(
+        self,
+        real_data: pd.DataFrame,
+        sequence_key: str,
+        sequence_index: str,
+    ) -> None:
+        """Train the temporal model on real sequential data.
+
+        Args:
+            real_data: DataFrame with sequence_key and sequence_index columns.
+            sequence_key: Column identifying each sequence (e.g., customer_id).
+            sequence_index: Column defining temporal order (e.g., transaction_date).
+        """
+        ...
+
+    async def generate(self, num_sequences: int) -> pd.DataFrame:
+        """Generate synthetic sequential data.
+
+        Args:
+            num_sequences: Number of independent sequences to generate.
+
+        Returns:
+            DataFrame with synthetic time-series rows.
+        """
+        ...
+
+    def is_trained(self) -> bool:
+        """Return True if the model has been trained.
+
+        Returns:
+            True if train() has been called successfully.
+        """
+        ...
+
+
+@runtime_checkable
+class PrivacyClientProtocol(Protocol):
+    """Protocol for the privacy engine HTTP client used by services."""
+
+    async def allocate_budget(
+        self,
+        tenant_id: uuid.UUID,
+        epsilon: float,
+        delta: float,
+    ) -> str:
+        """Request epsilon budget allocation, return allocation_id."""
+        ...
+
+    async def consume_budget(self, allocation_id: str) -> None:
+        """Consume a previously allocated DP budget."""
+        ...
+
+
 class IMultiTableSchemaRepository(Protocol):
     """Repository interface for MultiTableSchema persistence."""
 
